@@ -1,0 +1,4 @@
+# Optional Orbbec camera backend.
+# Install package name: pyorbbecsdk2
+# Runtime import name: pyorbbecsdk
+pyorbbecsdk2==2.0.18

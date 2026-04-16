@@ -1,54 +1,14 @@
-from __future__ import annotations
+"""Backward-compatible RealSense helpers re-exported from the new backend module."""
 
-from dataclasses import dataclass
-from typing import Any
+from .factory import stop_runtimes
+from .realsense_backend import BACKEND, intrinsics_to_dict, safe_get_info
+from .types import StreamRequest
 
-import numpy as np
-import pyrealsense2 as rs
-
-
-@dataclass(frozen=True)
-class DeviceInfo:
-    name: str
-    serial_number: str
-    firmware_version: str
-    usb_type_descriptor: str
-    product_line: str
+enumerate_devices = BACKEND.enumerate_devices
 
 
-@dataclass
-class CameraRuntime:
-    info: DeviceInfo
-    pipeline: rs.pipeline
-    align: rs.align
-    depth_scale: float
-
-
-def safe_get_info(device: rs.device, info_key: rs.camera_info) -> str:
-    try:
-        return device.get_info(info_key)
-    except RuntimeError:
-        return ""
-
-
-def enumerate_devices() -> list[DeviceInfo]:
-    ctx = rs.context()
-    devices = []
-    for dev in ctx.query_devices():
-        devices.append(
-            DeviceInfo(
-                name=safe_get_info(dev, rs.camera_info.name),
-                serial_number=safe_get_info(dev, rs.camera_info.serial_number),
-                firmware_version=safe_get_info(dev, rs.camera_info.firmware_version),
-                usb_type_descriptor=safe_get_info(dev, rs.camera_info.usb_type_descriptor),
-                product_line=safe_get_info(dev, rs.camera_info.product_line),
-            )
-        )
-    return devices
-
-
-def select_serials(devices: list[DeviceInfo], serials: list[str] | None, expected_count: int = 2) -> list[str]:
-    available = {dev.serial_number for dev in devices}
+def select_serials(devices, serials, expected_count: int = 2):
+    available = {device.serial_number for device in devices}
     if serials:
         missing = [serial for serial in serials if serial not in available]
         if missing:
@@ -58,91 +18,42 @@ def select_serials(devices: list[DeviceInfo], serials: list[str] | None, expecte
     if len(devices) < expected_count:
         raise RuntimeError(
             f"Expected at least {expected_count} RealSense devices, found {len(devices)}. "
-            "Use --list to inspect detection state."
+            "Use --list-devices to inspect detection state."
         )
-
     return [device.serial_number for device in devices[:expected_count]]
 
 
-def intrinsics_to_dict(intrinsics: rs.intrinsics) -> dict[str, Any]:
-    return {
-        "width": intrinsics.width,
-        "height": intrinsics.height,
-        "fx": intrinsics.fx,
-        "fy": intrinsics.fy,
-        "ppx": intrinsics.ppx,
-        "ppy": intrinsics.ppy,
-        "model": str(intrinsics.model),
-        "coeffs": list(intrinsics.coeffs),
-    }
-
-
 def build_runtime(
-    device_info: DeviceInfo,
+    device_info,
     width: int,
     height: int,
     fps: int,
     enable_depth: bool = True,
     enable_color: bool = True,
-) -> CameraRuntime:
-    pipeline = rs.pipeline()
-    config = rs.config()
-    config.enable_device(device_info.serial_number)
-    if enable_depth:
-        config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
-    if enable_color:
-        config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
-    profile = pipeline.start(config)
-
-    depth_sensor = profile.get_device().first_depth_sensor()
-    if depth_sensor.supports(rs.option.enable_auto_exposure):
-        depth_sensor.set_option(rs.option.enable_auto_exposure, 1)
-
-    return CameraRuntime(
-        info=device_info,
-        pipeline=pipeline,
-        align=rs.align(rs.stream.color),
-        depth_scale=depth_sensor.get_depth_scale(),
+):
+    if not enable_depth or not enable_color:
+        raise RuntimeError("The compatibility wrapper only supports color+depth streams.")
+    return BACKEND.open_runtime(
+        device_info,
+        StreamRequest(width=width, height=height, fps=fps, align_to_color=True),
     )
 
 
-def get_aligned_frame_bundle(
-    runtime: CameraRuntime,
-    depth_min_m: float,
-    depth_max_m: float,
-) -> dict[str, Any]:
-    frames = runtime.pipeline.wait_for_frames()
-    aligned_frames = runtime.align.process(frames)
-    color_frame = aligned_frames.get_color_frame()
-    depth_frame = aligned_frames.get_depth_frame()
-    if not color_frame or not depth_frame:
-        raise RuntimeError(f"Missing color or depth frame from RealSense pipeline {runtime.info.serial_number}.")
-
-    color = np.asanyarray(color_frame.get_data())
-    depth = np.asanyarray(depth_frame.get_data())
-
-    color_intrinsics = color_frame.profile.as_video_stream_profile().get_intrinsics()
-    depth_intrinsics = depth_frame.profile.as_video_stream_profile().get_intrinsics()
-
+def get_aligned_frame_bundle(runtime, depth_min_m: float, depth_max_m: float):
+    del depth_min_m, depth_max_m
+    bundle = BACKEND.read_frame_bundle(runtime)
     return {
-        "serial_number": runtime.info.serial_number,
-        "device_name": runtime.info.name,
-        "firmware_version": runtime.info.firmware_version,
-        "product_line": runtime.info.product_line,
-        "usb_type_descriptor": runtime.info.usb_type_descriptor,
-        "color": color,
-        "depth": depth,
-        "timestamp_ms": frames.get_timestamp(),
-        "frame_number": frames.get_frame_number(),
-        "depth_scale": runtime.depth_scale,
-        "color_intrinsics": intrinsics_to_dict(color_intrinsics),
-        "depth_intrinsics": intrinsics_to_dict(depth_intrinsics),
+        "serial_number": bundle.serial_number,
+        "device_name": bundle.device_name,
+        "firmware_version": bundle.firmware_version,
+        "product_line": bundle.product_line,
+        "usb_type_descriptor": bundle.usb_type_descriptor,
+        "color": bundle.color,
+        "depth": bundle.depth,
+        "timestamp_ms": bundle.timestamp_ms,
+        "frame_number": bundle.frame_number,
+        "depth_scale": bundle.depth_scale,
+        "color_intrinsics": bundle.color_intrinsics,
+        "depth_intrinsics": bundle.depth_intrinsics,
+        "resolved_stream": bundle.resolved_stream,
     }
-
-
-def stop_runtimes(runtimes: list[CameraRuntime]) -> None:
-    for runtime in runtimes:
-        try:
-            runtime.pipeline.stop()
-        except RuntimeError:
-            pass

@@ -9,3 +9,4 @@ __pycache__/
 outputs/
 data/
 *.jsonl
+Log/

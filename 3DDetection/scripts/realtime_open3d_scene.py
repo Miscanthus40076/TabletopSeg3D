@@ -18,11 +18,12 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from camera.realsense_capture import (  # noqa: E402
-    build_runtime,
+from camera import (  # noqa: E402
+    StreamRequest,
     enumerate_devices,
-    get_aligned_frame_bundle,
-    select_serials,
+    open_runtime,
+    read_frame_bundle,
+    select_device,
     stop_runtimes,
 )
 from geometry.pointcloud import (  # noqa: E402
@@ -64,8 +65,9 @@ BACKGROUND_COLOR_RGBA = np.array([0.12, 0.14, 0.16, 1.0], dtype=np.float32)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Realtime Open3D point-cloud scene viewer.")
-    parser.add_argument("--list-devices", action="store_true", help="List connected RealSense devices and exit.")
-    parser.add_argument("--serial", type=str, default="419522072950", help="RealSense serial to use.")
+    parser.add_argument("--camera-backend", type=str, default="auto", choices=["auto", "realsense", "orbbec"], help="Camera backend to use.")
+    parser.add_argument("--list-devices", action="store_true", help="List connected camera devices and exit.")
+    parser.add_argument("--serial", type=str, default="", help="Camera serial number to use.")
     parser.add_argument("--model", type=str, default="yolo11n-seg.pt", help="Ultralytics segmentation model.")
     parser.add_argument("--device", type=str, default="cpu", help="Inference device.")
     parser.add_argument("--width", type=int, default=640, help="Camera stream width.")
@@ -75,7 +77,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--conf", type=float, default=0.25, help="Detection confidence threshold.")
     parser.add_argument("--iou", type=float, default=0.45, help="NMS IoU threshold.")
     parser.add_argument("--max-det", type=int, default=10, help="Maximum detections per frame.")
-    parser.add_argument("--target-class", type=str, default="", help="Optional class filter.")
+    parser.add_argument("--target-class", type=str, default="", help="Optional class filter. Use commas for a fixed ordered list, e.g. mouse,banana.")
+    parser.add_argument("--target-table", action="store_true", help="Print a live fixed-order table for --target-class objects.")
     parser.add_argument("--min-depth", type=float, default=0.10, help="Minimum valid depth in meters.")
     parser.add_argument("--max-depth", type=float, default=1.50, help="Maximum valid depth in meters.")
     parser.add_argument("--min-points", type=int, default=500, help="Minimum object point count for a 3D box.")
@@ -86,13 +89,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--show-object-points", action="store_true", help="Also color object mask points in the full-scene point cloud.")
     parser.add_argument("--show-labels", action="store_true", help="Show 3D labels for detected objects in the Open3D scene.")
     parser.add_argument("--no-display", action="store_true", help="Disable Open3D window and print timing only.")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.target_table and not args.target_class.strip():
+        parser.error("--target-table requires --target-class.")
+    args.target_classes = parse_target_classes(args.target_class)
+    return args
 
 
 def load_model(model_name: str):
     from ultralytics import YOLO
 
     return YOLO(model_name)
+
+
+def parse_target_classes(target_class: str) -> list[str]:
+    return [name.strip() for name in target_class.split(",") if name.strip()]
 
 
 def color_for_index(index: int) -> np.ndarray:
@@ -137,7 +148,7 @@ def run_inference(model, color_image: np.ndarray, args: argparse.Namespace) -> l
     for idx, mask_arr in enumerate(masks):
         class_id = int(class_ids[idx])
         class_name = result.names.get(class_id, str(class_id))
-        if args.target_class and class_name != args.target_class:
+        if args.target_classes and class_name not in args.target_classes:
             continue
         mask_resized = cv2.resize(mask_arr, (image_w, image_h), interpolation=cv2.INTER_NEAREST) > 0.5
         detections.append(
@@ -398,29 +409,122 @@ def frame_output_record(
     }
 
 
+def _format_nullable_float(value: float | None, digits: int = 3) -> str:
+    if value is None:
+        return "null"
+    return f"{float(value):.{digits}f}"
+
+
+def _best_detection_for_class(
+    detections_3d: list[Detection3D],
+    class_name: str,
+) -> Detection3D | None:
+    matches = [det for det in detections_3d if det.class_name == class_name]
+    if not matches:
+        return None
+    return max(matches, key=lambda det: (det.center_xyz is not None, det.confidence))
+
+
+def target_table_record(
+    target_classes: list[str],
+    detections_3d: list[Detection3D],
+) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for slot, class_name in enumerate(target_classes, start=1):
+        det = _best_detection_for_class(detections_3d, class_name)
+        if det is None or det.center_xyz is None or det.extent_xyz is None:
+            rows.append(
+                {
+                    "slot": str(slot),
+                    "class": class_name,
+                    "status": "null",
+                    "conf": "null",
+                    "x_m": "null",
+                    "y_m": "null",
+                    "z_m": "null",
+                    "size_m": "null",
+                    "yaw_deg": "null",
+                    "points": "null",
+                }
+            )
+            continue
+
+        rows.append(
+            {
+                "slot": str(slot),
+                "class": class_name,
+                "status": "detected",
+                "conf": _format_nullable_float(det.confidence, 3),
+                "x_m": _format_nullable_float(det.center_xyz[0], 3),
+                "y_m": _format_nullable_float(det.center_xyz[1], 3),
+                "z_m": _format_nullable_float(det.center_xyz[2], 3),
+                "size_m": "x".join(_format_nullable_float(value, 3) for value in det.extent_xyz),
+                "yaw_deg": _format_nullable_float(det.yaw_deg, 1),
+                "points": str(int(det.point_count)),
+            }
+        )
+    return rows
+
+
+def render_target_table(
+    frame_index: int,
+    fps_value: float,
+    infer_ms: float,
+    geom_ms: float,
+    target_classes: list[str],
+    detections_3d: list[Detection3D],
+) -> str:
+    rows = target_table_record(target_classes, detections_3d)
+    headers = ["slot", "class", "status", "conf", "x_m", "y_m", "z_m", "size_m", "yaw_deg", "points"]
+    widths = {
+        header: max(len(header), *(len(row[header]) for row in rows))
+        for header in headers
+    }
+    line = "+-" + "-+-".join("-" * widths[header] for header in headers) + "-+"
+    header_line = "| " + " | ".join(header.ljust(widths[header]) for header in headers) + " |"
+    body_lines = [
+        "| " + " | ".join(row[header].ljust(widths[header]) for header in headers) + " |"
+        for row in rows
+    ]
+    title = (
+        f"Target table | frame={frame_index} | fps={fps_value:.2f} | "
+        f"infer={infer_ms:.1f}ms | geom={geom_ms:.1f}ms"
+    )
+    return "\n".join([title, line, header_line, line, *body_lines, line])
+
+
+def print_live_target_table(table_text: str) -> None:
+    print("\033[2J\033[H" + table_text, flush=True)
+
+
 def print_connected_devices(devices: list[Any]) -> None:
     if not devices:
-        print("No RealSense devices found.")
+        print("No camera devices found.")
         return
 
-    print("Connected RealSense devices:")
+    print("Connected camera devices:")
     for device in devices:
-        print(f"- {device.name} | serial={device.serial_number}")
+        print(
+            f"- backend={device.backend} | {device.name} | serial={device.serial_number}"
+        )
 
 
 def main() -> int:
     args = parse_args()
-    import open3d as o3d
 
-    devices = enumerate_devices()
+    devices = enumerate_devices(args.camera_backend)
     if args.list_devices:
         print_connected_devices(devices)
         return 0
-    serial = select_serials(devices, [args.serial], expected_count=1)[0]
-    device_map = {device.serial_number: device for device in devices}
+    selected_device = select_device(devices, serial=args.serial, backend_name=args.camera_backend)
+
+    import open3d as o3d
 
     model = load_model(args.model)
-    runtime = build_runtime(device_map[serial], args.width, args.height, args.fps)
+    runtime = open_runtime(
+        selected_device,
+        StreamRequest(width=args.width, height=args.height, fps=args.fps, align_to_color=True),
+    )
     frame_times: list[float] = []
     frame_counter = 0
 
@@ -437,11 +541,11 @@ def main() -> int:
 
     try:
         for _ in range(args.warmup_frames):
-            get_aligned_frame_bundle(runtime, args.min_depth, args.max_depth)
+            read_frame_bundle(runtime)
 
-        warm_bundle = get_aligned_frame_bundle(runtime, args.min_depth, args.max_depth)
+        warm_bundle = read_frame_bundle(runtime)
         model.predict(
-            source=warm_bundle["color"],
+            source=warm_bundle.color,
             task="segment",
             device=args.device,
             imgsz=args.imgsz,
@@ -452,16 +556,16 @@ def main() -> int:
         )
 
         initial_scene_points, initial_scene_colors = build_scene_point_cloud(
-            color_image=warm_bundle["color"],
-            depth_m=warm_bundle["depth"].astype(np.float32) * float(warm_bundle["depth_scale"]),
-            intrinsics=warm_bundle["color_intrinsics"],
+            color_image=warm_bundle.color,
+            depth_m=warm_bundle.depth.astype(np.float32) * float(warm_bundle.depth_scale),
+            intrinsics=warm_bundle.color_intrinsics,
             args=args,
         )
         table_normal = estimate_table_normal(initial_scene_points, o3d)
-        initial_depth_m = warm_bundle["depth"].astype(np.float32) * float(warm_bundle["depth_scale"])
-        initial_detections = run_inference(model, warm_bundle["color"], args)
+        initial_depth_m = warm_bundle.depth.astype(np.float32) * float(warm_bundle.depth_scale)
+        initial_detections = run_inference(model, warm_bundle.color, args)
         initial_detections_3d = [
-            build_detection_3d(det, initial_depth_m, warm_bundle["color_intrinsics"], table_normal, args)
+            build_detection_3d(det, initial_depth_m, warm_bundle.color_intrinsics, table_normal, args)
             for det in initial_detections
         ]
         if args.show_object_points:
@@ -543,22 +647,22 @@ def main() -> int:
 
         while True:
             loop_start = time.perf_counter()
-            bundle = get_aligned_frame_bundle(runtime, args.min_depth, args.max_depth)
-            depth_m = bundle["depth"].astype(np.float32) * float(bundle["depth_scale"])
+            bundle = read_frame_bundle(runtime)
+            depth_m = bundle.depth.astype(np.float32) * float(bundle.depth_scale)
 
             infer_start = time.perf_counter()
-            detections = run_inference(model, bundle["color"], args)
+            detections = run_inference(model, bundle.color, args)
             infer_ms = (time.perf_counter() - infer_start) * 1000.0
 
             geom_start = time.perf_counter()
             detections_3d = [
-                build_detection_3d(det, depth_m, bundle["color_intrinsics"], table_normal, args)
+                build_detection_3d(det, depth_m, bundle.color_intrinsics, table_normal, args)
                 for det in detections
             ]
             scene_points, scene_colors = build_scene_point_cloud(
-                color_image=bundle["color"],
+                color_image=bundle.color,
                 depth_m=depth_m,
-                intrinsics=bundle["color_intrinsics"],
+                intrinsics=bundle.color_intrinsics,
                 args=args,
             )
             if args.show_object_points:
@@ -571,21 +675,34 @@ def main() -> int:
                 frame_times.pop(0)
             fps_value = len(frame_times) / sum(frame_times)
 
-            if args.no_display:
-                print(
-                    json.dumps(
-                        frame_output_record(
-                            frame_index=frame_counter,
-                            fps_value=fps_value,
-                            infer_ms=infer_ms,
-                            geom_ms=geom_ms,
-                            scene_points=scene_points,
-                            table_normal=table_normal,
-                            detections_3d=detections_3d,
-                        ),
-                        ensure_ascii=False,
+            if args.target_table:
+                print_live_target_table(
+                    render_target_table(
+                        frame_index=frame_counter,
+                        fps_value=fps_value,
+                        infer_ms=infer_ms,
+                        geom_ms=geom_ms,
+                        target_classes=args.target_classes,
+                        detections_3d=detections_3d,
                     )
                 )
+
+            if args.no_display:
+                if not args.target_table:
+                    print(
+                        json.dumps(
+                            frame_output_record(
+                                frame_index=frame_counter,
+                                fps_value=fps_value,
+                                infer_ms=infer_ms,
+                                geom_ms=geom_ms,
+                                scene_points=scene_points,
+                                table_normal=table_normal,
+                                detections_3d=detections_3d,
+                            ),
+                            ensure_ascii=False,
+                        )
+                    )
             else:
                 if label_mode:
                     vis.remove_geometry("scene")

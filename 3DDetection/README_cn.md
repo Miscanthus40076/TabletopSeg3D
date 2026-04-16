@@ -2,7 +2,7 @@
 
 English documentation: [README.md](./README.md)
 
-基于 `Intel RealSense + YOLO Segmentation + Open3D` 的实时桌面目标三维检测工程。
+基于可插拔相机后端 + `YOLO Segmentation + Open3D` 的实时桌面目标三维检测工程。
 
 ![TabletopSeg3D 演示图](photo/1.png)
 
@@ -13,7 +13,9 @@ English documentation: [README.md](./README.md)
 
 系统特性：
 
-- 单相机实时运行，支持 `realsense` 系列相机，目前在`D435i`、`D405`上经过测试
+- 单相机实时运行，底层通过统一相机后端抽象接入
+- 已支持 `realsense`，目前在 `D435i`、`D405` 上经过测试
+- 已接入 `Orbbec Gemini2`，默认彩色 `640x480`，深度 `640x400`
 - YOLO 实例分割
 - 深度回投到点云
 - 桌面对齐 OBB
@@ -38,7 +40,11 @@ TabletopSeg3D/
 │   └── realtime_open3d_scene.py
 └── src/
     ├── camera/
-    │   └── realsense_capture.py
+    │   ├── factory.py
+    │   ├── orbbec_backend.py
+    │   ├── realsense_backend.py
+    │   ├── realsense_capture.py
+    │   └── types.py
     └── geometry/
         └── pointcloud.py
 ```
@@ -54,7 +60,17 @@ cd ./3DDetection
 python -m pip install -r requirements.txt
 ```
 
-如果你的系统还没有 `librealsense` 对应运行环境，需要先安装 Intel RealSense SDK。
+可选硬件依赖：
+
+- RealSense：如果系统还没有 `librealsense` 对应运行环境，需要先安装 Intel RealSense SDK
+- Orbbec：通过 `python -m pip install -r requirements-orbbec.txt` 安装
+
+说明：
+
+- Orbbec 的安装包名是 `pyorbbecsdk2`
+- 代码里的导入名仍然是 `pyorbbecsdk`
+- `requirements-orbbec.txt` 用来保持 Orbbec 为可选依赖，不强制所有环境安装 Orbbec SDK
+- 当前分支在 RealSense 真机回归前不建议合并回 `main`
 
 如果你希望使用 GPU 加速，还需要额外准备：
 
@@ -70,19 +86,20 @@ python -m pip install -r requirements.txt
 
 ## 查看已连接相机
 
-先查看当前连接的 RealSense 相机型号和序列号：
+先查看当前连接的相机型号和序列号：
 
 ```bash
 cd /home/misca/3DDetection
-python scripts/realtime_open3d_scene.py --list-devices
+python scripts/realtime_open3d_scene.py --list-devices --camera-backend auto
 ```
 
 输出示例：
 
 ```text
-Connected RealSense devices:
-- Intel RealSense D405 | serial=409122273421
-- Intel RealSense D435I | serial=419522072950
+Connected camera devices:
+- backend=realsense | Intel RealSense D405 | serial=409122273421
+- backend=realsense | Intel RealSense D435I | serial=419522072950
+- backend=orbbec | Orbbec Gemini2 | serial=AYXXXXXXXXXX
 ```
 
 ## 模型
@@ -110,6 +127,7 @@ yolo11n-seg.pt
 ```bash
 cd /home/misca/3DDetection
 python scripts/realtime_open3d_scene.py \
+  --camera-backend realsense \
   --serial 419522072950 \
   --model ./my_model.pt \
   --device cpu
@@ -121,6 +139,7 @@ python scripts/realtime_open3d_scene.py \
 ```bash
 cd /home/misca/3DDetection
 python scripts/realtime_open3d_scene.py \
+  --camera-backend realsense \
   --serial 419522072950 \
   --model runs/segment/train/weights/best.pt \
   --device cpu
@@ -131,10 +150,37 @@ python scripts/realtime_open3d_scene.py \
 ```bash
 cd /home/misca/3DDetection
 python scripts/realtime_open3d_scene.py \
+  --camera-backend realsense \
   --serial 419522072950 \
   --model runs/segment/train/weights/best.pt \
   --device cpu \
   --frames 10 \
+  --no-display
+```
+
+固定顺序目标表格：
+
+```bash
+cd /home/misca/3DDetection
+python scripts/realtime_open3d_scene.py \
+  --camera-backend orbbec \
+  --serial AY3Z331006L \
+  --device cpu \
+  --target-class mouse,banana \
+  --target-table
+```
+
+表格会固定目标顺序。上面的例子里第 1 行永远是 `mouse`，第 2 行永远是 `banana`；如果某个目标没检测到，对应行显示 `null`。
+
+如果只想在终端输出表格，不打开 Open3D 窗口，可以加 `--no-display`：
+
+```bash
+python scripts/realtime_open3d_scene.py \
+  --camera-backend orbbec \
+  --serial AY3Z331006L \
+  --device cpu \
+  --target-class mouse,banana \
+  --target-table \
   --no-display
 ```
 
@@ -143,6 +189,7 @@ python scripts/realtime_open3d_scene.py \
 ```bash
 cd /home/misca/3DDetection
 python scripts/realtime_open3d_scene.py \
+  --camera-backend realsense \
   --serial 409122273421 \
   --model runs/segment/train/weights/best.pt \
   --device cpu \
@@ -187,6 +234,7 @@ python scripts/realtime_open3d_scene.py \
 ```bash
 cd /home/misca/3DDetection
 python scripts/realtime_open3d_scene.py \
+  --camera-backend realsense \
   --serial 419522072950 \
   --device cpu
 ```
@@ -196,16 +244,35 @@ python scripts/realtime_open3d_scene.py \
 ```bash
 cd /home/misca/3DDetection
 python scripts/realtime_open3d_scene.py \
+  --camera-backend realsense \
   --serial 419522072950 \
   --device cpu \
   --show-labels
 ```
+
+`Orbbec Gemini2` 默认示例：
+
+```bash
+cd /home/misca/3DDetection
+python scripts/realtime_open3d_scene.py \
+  --camera-backend orbbec \
+  --serial <gemini2-serial> \
+  --device cpu
+```
+
+`Gemini2` 默认流说明：
+
+- 默认共同目标请求是 `640x480@30`
+- 默认彩色流实际为 `640x480`
+- 默认深度流实际为 `640x400`
+- 实际启用分辨率会记录在后端返回的 `resolved_stream` 中
 
 使用自定义模型：
 
 ```bash
 cd /home/misca/3DDetection
 python scripts/realtime_open3d_scene.py \
+  --camera-backend realsense \
   --serial 419522072950 \
   --model runs/segment/train/weights/best.pt \
   --device cpu
@@ -218,6 +285,7 @@ python scripts/realtime_open3d_scene.py \
 ```bash
 cd /home/misca/3DDetection
 python scripts/realtime_open3d_scene.py \
+  --camera-backend realsense \
   --serial 419522072950 \
   --device cpu \
   --frames 10 \
@@ -255,6 +323,7 @@ python scripts/realtime_open3d_scene.py \
 ```bash
 cd /home/misca/3DDetection
 python scripts/realtime_open3d_scene.py \
+  --camera-backend realsense \
   --serial 409122273421 \
   --device cpu \
   --min-depth 0.02 \
@@ -266,6 +335,7 @@ python scripts/realtime_open3d_scene.py \
 ```bash
 cd /home/misca/3DDetection
 python scripts/realtime_open3d_scene.py \
+  --camera-backend realsense \
   --serial 409122273421 \
   --device cpu \
   --min-depth 0.02 \
@@ -276,12 +346,15 @@ python scripts/realtime_open3d_scene.py \
 
 ## 主要参数
 
-- `--serial`：指定 RealSense 序列号
+- `--camera-backend`：选择 `auto`、`realsense` 或 `orbbec`
+- `--serial`：指定相机序列号
 - `--model`：指定 YOLO 分割模型
 - `--device`：推理设备，当前建议 `cpu`
+- `--width` / `--height` / `--fps`：传给当前后端的共同目标流配置
 - `--imgsz`：YOLO 推理尺寸
 - `--min-depth` / `--max-depth`：有效深度范围
-- `--target-class`：仅保留指定类别
+- `--target-class`：仅保留一个或多个指定类别；逗号顺序会保留，例如 `mouse,banana`
+- `--target-table`：为 `--target-class` 中的目标实时打印固定顺序终端表格
 - `--show-labels`：开启 3D 标注
 - `--show-object-points`：高亮目标点云
 - `--no-display`：关闭可视化，输出每帧 JSON
@@ -289,6 +362,7 @@ python scripts/realtime_open3d_scene.py \
 
 ## 当前实现说明
 
+- 当前相机层已经改成统一硬件抽象，可继续接入新的相机后端
 - 桌面法向在启动时估计一次
 - 3D 框为“桌面对齐 OBB”
 - 输出旋转只有一个自由度 `yaw`
